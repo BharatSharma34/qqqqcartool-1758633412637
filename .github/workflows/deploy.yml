@@ -1,0 +1,175 @@
+name: Deploy Lambda Tool
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install deployment tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 wheel
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-north-1
+
+      - name: Prepare Lambda Function
+        run: |
+          set -e
+          
+          # Create build directory
+          mkdir -p build
+          
+          # Copy user's tool code
+          cp tool.py build/
+          
+          # Create lambda_function.py with handler that imports user code
+          cat > build/lambda_function.py << 'EOF'
+import json
+import inspect
+import sys
+import os
+
+# Add current directory to path to import user's tool
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Import user's tool code
+import tool
+
+def lambda_handler(event, context):
+    try:
+        body = event.get("body")
+        if isinstance(body, str):
+            body = json.loads(body)
+
+        # Find all callable functions from the tool module (excluding built-ins and imports)
+        funcs = []
+        for name in dir(tool):
+            obj = getattr(tool, name)
+            if (callable(obj) and 
+                not name.startswith('_') and 
+                hasattr(obj, '__module__') and 
+                obj.__module__ == 'tool'):
+                funcs.append(obj)
+
+        if not funcs:
+            return {
+                "statusCode": 500,
+                "body": json.dumps({"error": "No callable function found in tool"})
+            }
+
+        # Use the last defined function as the main tool function
+        func = funcs[-1]
+        sig = inspect.signature(func)
+        
+        # Match parameters from request body to function arguments
+        args = {}
+        for param_name in sig.parameters:
+            if param_name in body:
+                args[param_name] = body[param_name]
+
+        # Call the user's function
+        result = func(**args)
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps(result)
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            })
+        }
+EOF
+
+      - name: Install Dependencies and Deploy
+        run: |
+          set -e
+          
+          # Use repo name as function name, sanitized
+          func_name=$(echo "${{ github.repository }}" | cut -d'/' -f2 | sed 's/[^a-zA-Z0-9_-]/_/g')
+          
+          echo "🚀 Preparing function: $func_name"
+          
+          # Install dependencies if requirements.txt exists and is not empty
+          if [[ -s requirements.txt ]]; then
+            echo "📦 Installing dependencies for $func_name"
+            pip install -r requirements.txt -t build/
+          else
+            echo "⚠️ No or empty requirements.txt found for $func_name"
+          fi
+          
+          # Create zip file
+          cd build
+          zip -r "../${func_name}.zip" . > /dev/null
+          cd ..
+          
+          echo "🚀 Deploying $func_name to Lambda..."
+          
+          # Check if function exists and update or create accordingly
+          if aws lambda get-function --function-name "$func_name" > /dev/null 2>&1; then
+            echo "🔄 Updating existing function $func_name"
+            
+            # Retry loop for update
+            max_retries=5
+            attempt=1
+            while [ $attempt -le $max_retries ]; do
+              if aws lambda update-function-code \
+                  --function-name "$func_name" \
+                  --zip-file fileb://"${func_name}.zip"; then
+                echo "✅ Successfully updated $func_name"
+                break
+              else
+                echo "⚠️ Update in progress or failed (attempt $attempt), retrying in 10s..."
+                sleep 10
+              fi
+              attempt=$((attempt + 1))
+            done
+            
+          else
+            echo "🆕 Creating new function $func_name"
+            aws lambda create-function \
+              --function-name "$func_name" \
+              --runtime python3.11 \
+              --role arn:aws:iam::851725561714:role/Python_lambda \
+              --handler lambda_function.lambda_handler \
+              --zip-file fileb://"${func_name}.zip" \
+              --timeout 60 \
+              --memory-size 128 \
+              --environment Variables="{ENV=prod,TOOL_SECRET=${{ secrets.TOOL_SECRET }}}" || {
+                echo "❌ Failed to create function $func_name"
+                exit 1
+              }
+          fi
+          
+          echo "✅ Successfully deployed $func_name"
+          
+          # Output the function URL for easy access
+          aws lambda get-function --function-name "$func_name" --query 'Configuration.FunctionArn'
