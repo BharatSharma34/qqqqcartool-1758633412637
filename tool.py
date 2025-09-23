@@ -1,16 +1,17 @@
-# Add your tool logic here
-def example_function(input_data):
-    """
-    Replace this with your actual tool function.
-    This function will be automatically called when your tool is invoked.
-    
-    Parameters:
-    input_data: The data passed to your tool
-    
-    Returns:
-    Any JSON-serializable data
-    """
-    return {"message": "Hello from qqqqCarTool!", "input": input_data}
+import json
+import inspect
 
-# You can add multiple functions here
-# The last defined function will be used as the main tool function
+from tapestrysdk import image_to_text
+
+# Hardcoded token and system prompt
+token = "sk-tvyod3gap-mfwkw5wu"
+system_prompt = ""
+
+print("adding a line")
+def extract_info_from_image(user_prompt, document,name):
+    try:
+        result = image_to_text(token, user_prompt, document, name, system_prompt)
+        return result
+    except Exception as e:
+        
+        return {"error": str(e)}
